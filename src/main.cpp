@@ -57,5 +57,6 @@ void server_no_client() { set_color(0, 50, 0); }
 
 void loop() {
   t = millis();
-  no_connection();
+  // no_connection();
+  connected();
 }
