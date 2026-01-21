@@ -1,5 +1,4 @@
 #include "mesh_common.h"
-#include "role.h"
 
 // Forward declare both role functions for linter
 void mesh_root_start(void);

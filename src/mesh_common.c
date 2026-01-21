@@ -57,12 +57,21 @@ void mesh_init(int is_root) {
   // optional parameters
   cfg.channel = MESH_CHANNEL;
   cfg.mesh_ap.max_connection = 2;
+  // Dummy external router (no internet for you)
+  strcpy((char *)cfg.router.ssid, "mesh_dummy");
+  cfg.router.ssid_len = strlen("mesh_dummy");
+  cfg.router.password[0] = '\0'; // open network
 
   // initialize mesh
+  ESP_ERROR_CHECK(esp_mesh_set_self_organized(true, false));
   ESP_ERROR_CHECK(esp_mesh_init());
   ESP_ERROR_CHECK(esp_mesh_set_config(&cfg));
   ESP_ERROR_CHECK(esp_mesh_set_max_layer(MESH_MAX_LAYER));
-  ESP_ERROR_CHECK(esp_mesh_set_type(is_root ? MESH_ROOT : MESH_NODE));
+  // ESP_ERROR_CHECK(esp_mesh_set_type(is_root ? MESH_ROOT : MESH_NODE));
+  if (is_root) {
+    ESP_ERROR_CHECK(esp_mesh_set_type(MESH_ROOT));
+  }
+
   ESP_ERROR_CHECK(esp_mesh_start());
 
   ESP_LOGI(TAG, "Mesh initialization complete");
