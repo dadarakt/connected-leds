@@ -1,5 +1,3 @@
-
-#include "driver/ledc.h"
 #include "esp_crc.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -8,8 +6,6 @@
 #include "esp_now.h"
 #include "esp_random.h"
 #include "esp_wifi.h"
-#include "esp_wifi_types.h" // for wifi_tx_info_t
-#include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
@@ -17,12 +13,12 @@
 #include "mesh_common.h"
 #include "mesh_config.h"
 #include "nvs_flash.h"
-#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 static const char *TAG = "esp_now_rgb";
+
+static QueueHandle_t led_queue;
 
 typedef enum { MSG_TYPE_RGB = 0 } msg_type_t;
 
@@ -36,9 +32,28 @@ static uint32_t last_seq = 0;
 
 // Forward declarations
 void wifi_init(void);
-void init_espnow(void);
 void set_rgb(uint8_t r, uint8_t g, uint8_t b);
 void add_broadcast_peer(void);
+static void led_task(void *pvParameter);
+static esp_err_t espnow_init(void);
+
+void app_main(void) {
+  // Initialize NVS
+  esp_err_t ret = nvs_flash_init();
+  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    ret = nvs_flash_init();
+  }
+  ESP_ERROR_CHECK(ret);
+
+  leds_init();
+  led_queue = xQueueCreate(4, sizeof(led_update_t));
+  xTaskCreate(led_task, "led_task", 2048, NULL, 1, NULL);
+
+  wifi_init();
+  espnow_init();
+}
 
 static QueueHandle_t s_espnow_queue = NULL;
 static uint8_t s_broadcast_mac[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF,
@@ -136,7 +151,7 @@ int espnow_data_parse(uint8_t *data, uint16_t data_len, uint8_t *state,
 void espnow_data_prepare(espnow_send_param_t *send_param) {
   espnow_data_t *buf = (espnow_data_t *)send_param->buffer;
 
-  assert(send_param->len >= sizeof(espnow_data_t));
+  // assert(send_param->len >= sizeof(espnow_data_t));
 
   buf->type = IS_BROADCAST_ADDR(send_param->dest_mac) ? ESPNOW_DATA_BROADCAST
                                                       : ESPNOW_DATA_UNICAST;
@@ -149,9 +164,42 @@ void espnow_data_prepare(espnow_send_param_t *send_param) {
   buf->crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)buf, send_param->len);
 }
 
+static void led_task(void *pvParameter) {
+  led_task_state_t state = {
+      .led_on = false,
+      .period_ms = 500,
+      .color = {.r = 255, .g = 0, .b = 0},
+  };
+
+  TickType_t last_wake = xTaskGetTickCount();
+
+  while (1) {
+    led_update_t update;
+
+    /* Wait for update OR timeout for blinking */
+    if (xQueueReceive(led_queue, &update, pdMS_TO_TICKS(state.period_ms)) ==
+        pdTRUE) {
+
+      if (update.set_led_on)
+        state.led_on = update.led_on;
+
+      if (update.set_period)
+        state.period_ms = update.period_ms;
+
+      if (update.set_color)
+        state.color = update.color;
+    }
+
+    /* Blink */
+    state.led_on = !state.led_on;
+    leds_set_rgb(state.led_on, state.color);
+  }
+}
+
 static void espnow_task(void *pvParameter) {
   espnow_event_t evt;
   uint8_t recv_state = 0;
+
   uint16_t recv_seq = 0;
   uint32_t recv_magic = 0;
   bool is_broadcast = false;
@@ -222,6 +270,13 @@ static void espnow_task(void *pvParameter) {
 
         /* If MAC address does not exist in peer list, add it to peer list. */
         if (esp_now_is_peer_exist(recv_cb->mac_addr) == false) {
+
+          led_update_t u = {.set_color = true,
+                            .color = {0, 255, 0},
+                            .set_period = true,
+                            .period_ms = 100};
+          xQueueSend(led_queue, &u, 0);
+
           esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
           if (peer == NULL) {
             ESP_LOGE(TAG, "Malloc peer information fail");
@@ -244,13 +299,14 @@ static void espnow_task(void *pvParameter) {
         }
 
         /* If receive broadcast ESPNOW data which indicates that the other
-         * device has received broadcast ESPNOW data and the local magic number
-         * is bigger than that in the received broadcast ESPNOW data, stop
-         * sending broadcast ESPNOW data and start sending unicast ESPNOW data.
+         * device has received broadcast ESPNOW data and the local magic
+         * number is bigger than that in the received broadcast ESPNOW data,
+         * stop sending broadcast ESPNOW data and start sending unicast ESPNOW
+         * data.
          */
         if (recv_state == 1) {
-          /* The device which has the bigger magic number sends ESPNOW data, the
-           * other one receives ESPNOW data.
+          /* The device which has the bigger magic number sends ESPNOW data,
+           * the other one receives ESPNOW data.
            */
           if (send_param->unicast == false && send_param->magic >= recv_magic) {
             ESP_LOGI(TAG, "Start sending unicast data");
@@ -300,7 +356,8 @@ static esp_err_t espnow_init(void) {
     return ESP_FAIL;
   }
 
-  /* Initialize ESPNOW and register sending and receiving callback function. */
+  /* Initialize ESPNOW and register sending and receiving callback function.
+   */
   ESP_ERROR_CHECK(esp_now_init());
   ESP_ERROR_CHECK(esp_now_register_send_cb(espnow_send_cb));
   ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
@@ -358,20 +415,13 @@ static esp_err_t espnow_init(void) {
   memcpy(send_param->dest_mac, s_broadcast_mac, ESP_NOW_ETH_ALEN);
   espnow_data_prepare(send_param);
 
-  xTaskCreate(espnow_task, "example_espnow_task", 2048, send_param, 4, NULL);
+  xTaskCreate(espnow_task, "espnow_task", 2048, send_param, 4, NULL);
 
   return ESP_OK;
 }
 
 // Initialize Wi-Fi STA mode
 void wifi_init(void) {
-  // esp_netif_init();
-  // esp_event_loop_create_default();
-  // wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  // esp_wifi_init(&cfg);
-  // esp_wifi_set_mode(WIFI_MODE_STA);
-  // esp_wifi_start();
-
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -395,144 +445,3 @@ static void espnow_deinit(espnow_send_param_t *send_param) {
   s_espnow_queue = NULL;
   esp_now_deinit();
 }
-
-void app_main(void) {
-  // Initialize NVS
-  esp_err_t ret = nvs_flash_init();
-  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    ESP_ERROR_CHECK(nvs_flash_erase());
-    ret = nvs_flash_init();
-  }
-  ESP_ERROR_CHECK(ret);
-
-  wifi_init();
-  espnow_init();
-}
-
-// void on_data_sent(const esp_now_send_info_t *info) {
-//   ESP_LOGI(TAG, "ESP-NOW send status: %s",
-//            info->status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
-// }
-
-// void on_data_recv(const uint8_t *mac_addr, const uint8_t *data, int len) {
-//   if (len < sizeof(rgb_msg_t))
-//     return;
-//   const rgb_msg_t *msg = (rgb_msg_t *)data;
-//
-//   if (msg->type != MSG_TYPE_RGB)
-//     return;
-//
-//   // Only update if sequence number is newer
-//   if (msg->seq > last_seq) {
-//     last_seq = msg->seq;
-//     set_rgb(msg->r, msg->g, msg->b);
-//     ESP_LOGI(TAG,
-//              "Updated RGB from %02x:%02x:%02x:%02x:%02x:%02x -> R:%d G:%d
-//              B:%d "
-//              "(seq:%d)",
-//              mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4],
-//              mac_addr[5], msg->r, msg->g, msg->b, msg->seq);
-//   }
-// }
-
-// Add broadcast peer
-void add_broadcast_peer(void) {
-  esp_now_peer_info_t peer = {0};
-  memset(peer.peer_addr, 0xFF, 6); // broadcast
-  peer.channel = 0;
-  peer.encrypt = false;
-  esp_now_add_peer(&peer);
-}
-
-//// Initialize ESP-NOW
-// void init_espnow(void) {
-//   if (esp_now_init() != ESP_OK) {
-//     ESP_LOGE(TAG, "ESP-NOW init failed");
-//     return;
-//   }
-//   esp_now_register_send_cb(on_data_sent);
-//   esp_now_register_recv_cb(on_data_recv);
-//   add_broadcast_peer();
-// }
-//
-//// Set RGB LED using LEDC PWM
-// void set_rgb(uint8_t r, uint8_t g, uint8_t b) {
-//   ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_R, r);
-//   ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_R);
-//
-//   ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_G, g);
-//   ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_G);
-//
-//   ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_B, b);
-//   ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_B);
-// }
-//
-//// Task: periodically generate and broadcast a color
-// void rgb_broadcast_task(void *arg) {
-//   rgb_msg_t msg = {0};
-//   msg.type = MSG_TYPE_RGB;
-//
-//   uint32_t seq = 0;
-//   uint8_t r = 255, g = 0, b = 0;
-//
-//   while (1) {
-//     seq++;
-//     msg.seq = seq;
-//     msg.r = r;
-//     msg.g = g;
-//     msg.b = b;
-//
-//     set_rgb(r, g, b);
-//     esp_now_send(NULL, (uint8_t *)&msg, sizeof(msg));
-//
-//     // simple rainbow cycle
-//     uint8_t tmp = r;
-//     r = g;
-//     g = b;
-//     b = tmp;
-//
-//     vTaskDelay(pdMS_TO_TICKS(2000)); // change color every 2 seconds
-//   }
-// }
-//
-//// LEDC PWM init
-// void ledc_init(void) {
-//   ledc_timer_config_t timer = {.duty_resolution = LEDC_DUTY_RES,
-//                                .freq_hz = 5000,
-//                                .speed_mode = LEDC_MODE,
-//                                .timer_num = LEDC_TIMER};
-//   ledc_timer_config(&timer);
-//
-//   ledc_channel_config_t channels[3] = {{.channel = LEDC_CHANNEL_R,
-//                                         .duty = 0,
-//                                         .gpio_num = LED_R,
-//                                         .speed_mode = LEDC_MODE,
-//                                         .hpoint = 0,
-//                                         .timer_sel = LEDC_TIMER},
-//                                        {.channel = LEDC_CHANNEL_G,
-//                                         .duty = 0,
-//                                         .gpio_num = LED_G,
-//                                         .speed_mode = LEDC_MODE,
-//                                         .hpoint = 0,
-//                                         .timer_sel = LEDC_TIMER},
-//                                        {.channel = LEDC_CHANNEL_B,
-//                                         .duty = 0,
-//                                         .gpio_num = LED_B,
-//                                         .speed_mode = LEDC_MODE,
-//                                         .hpoint = 0,
-//                                         .timer_sel = LEDC_TIMER}};
-//   for (int i = 0; i < 3; i++)
-//     ledc_channel_config(&channels[i]);
-// }
-//
-// void app_main(void) {
-//   nvs_flash_init();
-//   init_wifi();
-//   init_espnow();
-//   ledc_init();
-//
-//   xTaskCreate(rgb_broadcast_task, "rgb_task", 4096, NULL, 5, NULL);
-//
-//   ESP_LOGI(TAG, "ESP-NOW RGB sync node started");
-// }
