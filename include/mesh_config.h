@@ -1,8 +1,22 @@
 #pragma once
 
+#include "esp_now.h"
+#include "esp_wifi_types.h"
 #define MESH_CHANNEL 6
 #define MESH_MAX_LAYER 3
 
-#define LED_GPIO_R GPIO_NUM_25
-#define LED_GPIO_G GPIO_NUM_26
-#define LED_GPIO_B GPIO_NUM_27
+// Moving out config from KConfig file to here
+#define ESPNOW_WIFI_MODE WIFI_MODE_STA
+#define ESPNOW_WIFI_IF WIFI_IF_STA
+#define ESPNOW_PMK "pmk1234567890123"
+#define ESPNOW_LMK "lmk1234567890123"
+#define ESPNOW_CHANNEL 1
+#define ESPNOW_SEND_COUNT 100
+#define ESPNOW_SEND_DELAY 1000
+#define ESPNOW_SEND_LEN 10
+#define ESPNOW_ENABLE_LONG_RANGE false
+#define ESPNOW_ENABLE_POWER_SAVE false
+#define ESPNOW_WAKE_WINDOW 50
+#define ESPNOW_WAKE_INTERVAL 100
+#define ESPNOW_QUEUE_SIZE 6
+#define ESPNOW_MAXDELAY 512

@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "esp_mesh.h"
 #include "esp_wifi.h"
+#include "leds.h"
 #include "mesh_config.h"
 #include "nvs_flash.h"
 #include <string.h>
