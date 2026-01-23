@@ -20,7 +20,13 @@ typedef struct {
   uint8_t b;
 } __attribute__((packed)) rgb;
 
+typedef enum {
+  LED_MODE_SEARCHING, // red blink
+  LED_MODE_SYNCED,    // green synced blink
+} led_mode_t;
+
 typedef struct {
+  led_mode_t mode;
   uint32_t period_ms;
   rgb color;
 } led_task_state_t;
@@ -34,9 +40,12 @@ typedef struct {
 
   uint32_t period_ms;
   int64_t t0_us; // esp_timer_get_time() reference
+  int64_t tx_us; // esp_timer_get_time() reference
 } __attribute__((packed)) led_sync_payload_t;
 
 typedef struct {
+  bool set_mode;
+  led_mode_t mode;
   bool set_led_on;
   bool led_on;
 
@@ -45,6 +54,8 @@ typedef struct {
 
   bool set_color;
   rgb color;
+
+  int64_t tx_us;
 
   bool set_sync;
   int64_t t0_us; // sync reference in esp_timer time

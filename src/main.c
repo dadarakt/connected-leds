@@ -2,6 +2,8 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_timer.h"
+
 #include "esp_netif.h"
 #include "esp_now.h"
 #include "esp_random.h"
@@ -20,6 +22,8 @@
 static const char *TAG = "esp_now_rgb";
 
 static QueueHandle_t led_queue;
+static led_sync_payload_t last_sync;
+static bool sync_valid = false;
 
 typedef enum { MSG_TYPE_RGB = 0, MSG_TYPE_SYNC = 1 } msg_type_t;
 
@@ -126,68 +130,72 @@ int espnow_data_parse(uint8_t *data, uint16_t data_len, uint8_t *state,
 /* Prepare ESPNOW data to be sent. */
 void espnow_data_prepare(send_param_t *send_param) {
   data_t *buf = (data_t *)send_param->buffer;
-
-  // assert(send_param->len >= sizeof(espnow_data_t));
-
   buf->type =
       IS_BROADCAST_ADDR(send_param->dest_mac) ? DATA_BROADCAST : DATA_UNICAST;
   buf->state = send_param->state;
   buf->seq_num = s_espnow_seq[buf->type]++;
   buf->crc = 0;
   buf->magic = send_param->magic;
+
   led_sync_payload_t *p = (led_sync_payload_t *)buf->payload;
   p->payload_type = PAYLOAD_TYPE_LED_SYNC;
   p->r = 0;
   p->g = 10;
   p->b = 0;
   p->period_ms = 1000;
-  p->t0_us = esp_timer_get_time() + 200000; // 200 ms in future
-  send_param->len = sizeof(data_t) + sizeof(led_sync_payload_t);
 
-  /* Fill all remaining bytes after the data with random values */
-  // esp_fill_random(buf->payload, send_param->len - sizeof(data_t));
+  int64_t now_us = esp_timer_get_time();
+  p->t0_us = now_us + 200000; // schedule blink 200ms in future
+  p->tx_us = now_us;          // mark transmit timestamp
+
+  send_param->len = sizeof(data_t) + sizeof(led_sync_payload_t);
+  last_sync = *p;
+  sync_valid = true;
 
   buf->crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)buf, send_param->len);
 }
 
-#include "esp_timer.h"
-
 static void led_task(void *pvParameter) {
   led_task_state_t state = {
+      .mode = LED_MODE_SEARCHING,
       .period_ms = 500,
       .color = {.r = 100, .g = 0, .b = 0},
   };
 
-  int64_t t0_us = esp_timer_get_time();
+  int64_t t0_local_us = esp_timer_get_time();
   bool has_sync = false;
 
   while (1) {
     led_update_t update;
-
-    /* Short timeout → responsive to updates, smooth blinking */
+    // check for incoming LED updates
     if (xQueueReceive(led_queue, &update, pdMS_TO_TICKS(20)) == pdTRUE) {
 
       if (update.set_period)
         state.period_ms = update.period_ms;
-
       if (update.set_color)
         state.color = update.color;
 
       if (update.set_sync) {
-        t0_us = update.t0_us;
+        // adjust sender t0 into local clock domain
+        int64_t now_us = esp_timer_get_time();
+        t0_local_us = update.t0_us + (now_us - update.tx_us);
         has_sync = true;
       }
     }
 
-    /* Compute phase from sync reference */
     int64_t now_us = esp_timer_get_time();
     int64_t period_us = (int64_t)state.period_ms * 1000;
 
-    int64_t phase_us = (now_us - t0_us) % period_us;
-    if (phase_us < 0)
-      phase_us += period_us;
-
-    bool led_on = (phase_us < (period_us / 2));
+    bool led_on;
+    if (state.mode == LED_MODE_SEARCHING || !has_sync) {
+      // simple blink while not synced
+      led_on = ((now_us / 500000) % 2);
+    } else {
+      int64_t phase_us = (now_us - t0_local_us) % period_us;
+      if (phase_us < 0)
+        phase_us += period_us;
+      led_on = (phase_us < (period_us / 2));
+    }
 
     leds_set_rgb(led_on, state.color);
   }
@@ -228,6 +236,22 @@ static void espnow_task(void *pvParameter) {
 
       if (is_broadcast && (send_param->broadcast == false)) {
         break;
+      }
+
+      if (!is_broadcast && send_cb->status == ESP_NOW_SEND_SUCCESS &&
+          sync_valid) {
+        led_update_t u = {
+            .set_mode = true,
+            .mode = LED_MODE_SYNCED,
+            .set_color = true,
+            .color = {last_sync.r, last_sync.g, last_sync.b},
+            .set_period = true,
+            .period_ms = last_sync.period_ms,
+            .set_sync = true,
+            .t0_us = last_sync.t0_us,
+        };
+
+        xQueueSend(led_queue, &u, 0);
       }
 
       if (!is_broadcast) {
@@ -285,6 +309,15 @@ static void espnow_task(void *pvParameter) {
           ESP_ERROR_CHECK(esp_now_add_peer(peer));
           free(peer);
 
+          /* LOCAL transition to synced mode (but not yet time-synced) */
+          led_update_t u = {
+              .set_mode = true,
+              .mode = LED_MODE_SYNCED,
+              .set_color = true,
+              .color = (rgb){0, 50, 0}, // green
+          };
+          xQueueSend(led_queue, &u, 0);
+
           // indicate that a connection was made
           // led_update_t u = {.set_color = true,
           //                  .color = {0, 255, 0},
@@ -337,6 +370,10 @@ static void espnow_task(void *pvParameter) {
         if (payload_type == PAYLOAD_TYPE_LED_SYNC) {
           led_sync_payload_t *p = (led_sync_payload_t *)d->payload;
 
+          // rx timestamp
+          int64_t rx_us = esp_timer_get_time();
+
+          // send to LED task: include tx timestamp
           led_update_t u = {
               .set_color = true,
               .color = {p->r, p->g, p->b},
@@ -344,6 +381,7 @@ static void espnow_task(void *pvParameter) {
               .period_ms = p->period_ms,
               .set_sync = true,
               .t0_us = p->t0_us,
+              .tx_us = p->tx_us, // sender's transmit time
           };
 
           xQueueSend(led_queue, &u, 0);
