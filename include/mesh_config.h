@@ -1,7 +1,5 @@
 #pragma once
 
-#include "esp_now.h"
-#include "esp_wifi_types.h"
 #define MESH_CHANNEL 6
 #define MESH_MAX_LAYER 3
 
