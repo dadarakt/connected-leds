@@ -21,10 +21,20 @@ typedef struct {
 } __attribute__((packed)) rgb;
 
 typedef struct {
-  bool led_on;
   uint32_t period_ms;
   rgb color;
 } led_task_state_t;
+
+typedef struct {
+  uint8_t payload_type; // PAYLOAD_TYPE_LED_SYNC
+
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+
+  uint32_t period_ms;
+  int64_t t0_us; // esp_timer_get_time() reference
+} __attribute__((packed)) led_sync_payload_t;
 
 typedef struct {
   bool set_led_on;
@@ -35,6 +45,9 @@ typedef struct {
 
   bool set_color;
   rgb color;
+
+  bool set_sync;
+  int64_t t0_us; // sync reference in esp_timer time
 } led_update_t;
 
 void leds_set_rgb(bool state, rgb color);

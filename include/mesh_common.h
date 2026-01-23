@@ -23,6 +23,11 @@ typedef enum {
   ESPNOW_RECV_CB,
 } event_id_t;
 
+typedef enum {
+  PAYLOAD_TYPE_NONE,
+  PAYLOAD_TYPE_LED_SYNC,
+} payload_type_t;
+
 typedef struct {
   uint8_t mac_addr[ESP_NOW_ETH_ALEN];
   esp_now_send_status_t status;

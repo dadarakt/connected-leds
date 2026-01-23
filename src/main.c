@@ -5,6 +5,7 @@
 #include "esp_netif.h"
 #include "esp_now.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -20,7 +21,7 @@ static const char *TAG = "esp_now_rgb";
 
 static QueueHandle_t led_queue;
 
-typedef enum { MSG_TYPE_RGB = 0 } msg_type_t;
+typedef enum { MSG_TYPE_RGB = 0, MSG_TYPE_SYNC = 1 } msg_type_t;
 
 typedef struct {
   uint8_t type;
@@ -134,40 +135,61 @@ void espnow_data_prepare(send_param_t *send_param) {
   buf->seq_num = s_espnow_seq[buf->type]++;
   buf->crc = 0;
   buf->magic = send_param->magic;
+  led_sync_payload_t *p = (led_sync_payload_t *)buf->payload;
+  p->payload_type = PAYLOAD_TYPE_LED_SYNC;
+  p->r = 0;
+  p->g = 10;
+  p->b = 0;
+  p->period_ms = 1000;
+  p->t0_us = esp_timer_get_time() + 200000; // 200 ms in future
+  send_param->len = sizeof(data_t) + sizeof(led_sync_payload_t);
+
   /* Fill all remaining bytes after the data with random values */
-  esp_fill_random(buf->payload, send_param->len - sizeof(data_t));
+  // esp_fill_random(buf->payload, send_param->len - sizeof(data_t));
+
   buf->crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)buf, send_param->len);
 }
 
+#include "esp_timer.h"
+
 static void led_task(void *pvParameter) {
   led_task_state_t state = {
-      .led_on = false,
       .period_ms = 500,
-      .color = {.r = 255, .g = 0, .b = 0},
+      .color = {.r = 100, .g = 0, .b = 0},
   };
 
-  // TickType_t last_wake = xTaskGetTickCount();
+  int64_t t0_us = esp_timer_get_time();
+  bool has_sync = false;
 
   while (1) {
     led_update_t update;
 
-    /* Wait for update OR timeout for blinking */
-    if (xQueueReceive(led_queue, &update, pdMS_TO_TICKS(state.period_ms)) ==
-        pdTRUE) {
-
-      if (update.set_led_on)
-        state.led_on = update.led_on;
+    /* Short timeout → responsive to updates, smooth blinking */
+    if (xQueueReceive(led_queue, &update, pdMS_TO_TICKS(20)) == pdTRUE) {
 
       if (update.set_period)
         state.period_ms = update.period_ms;
 
       if (update.set_color)
         state.color = update.color;
+
+      if (update.set_sync) {
+        t0_us = update.t0_us;
+        has_sync = true;
+      }
     }
 
-    /* Blink */
-    state.led_on = !state.led_on;
-    leds_set_rgb(state.led_on, state.color);
+    /* Compute phase from sync reference */
+    int64_t now_us = esp_timer_get_time();
+    int64_t period_us = (int64_t)state.period_ms * 1000;
+
+    int64_t phase_us = (now_us - t0_us) % period_us;
+    if (phase_us < 0)
+      phase_us += period_us;
+
+    bool led_on = (phase_us < (period_us / 2));
+
+    leds_set_rgb(led_on, state.color);
   }
 }
 
@@ -264,11 +286,11 @@ static void espnow_task(void *pvParameter) {
           free(peer);
 
           // indicate that a connection was made
-          led_update_t u = {.set_color = true,
-                            .color = {0, 255, 0},
-                            .set_period = true,
-                            .period_ms = 100};
-          xQueueSend(led_queue, &u, 0);
+          // led_update_t u = {.set_color = true,
+          //                  .color = {0, 255, 0},
+          //                  .set_period = true,
+          //                  .period_ms = 100};
+          // xQueueSend(led_queue, &u, 0);
         }
 
         /* Indicates that the device has received broadcast ESPNOW data. */
@@ -308,6 +330,24 @@ static void espnow_task(void *pvParameter) {
       } else if (ret == DATA_UNICAST) {
         ESP_LOGI(TAG, "Receive %dth unicast data from: " MACSTR ", len: %d",
                  recv_seq, MAC2STR(recv_cb->mac_addr), recv_cb->data_len);
+
+        data_t *d = (data_t *)recv_cb->data;
+        uint8_t payload_type = d->payload[0];
+
+        if (payload_type == PAYLOAD_TYPE_LED_SYNC) {
+          led_sync_payload_t *p = (led_sync_payload_t *)d->payload;
+
+          led_update_t u = {
+              .set_color = true,
+              .color = {p->r, p->g, p->b},
+              .set_period = true,
+              .period_ms = p->period_ms,
+              .set_sync = true,
+              .t0_us = p->t0_us,
+          };
+
+          xQueueSend(led_queue, &u, 0);
+        }
 
         /* If receive unicast ESPNOW data, also stop sending broadcast ESPNOW
          * data. */
