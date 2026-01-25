@@ -7,6 +7,7 @@
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "freertos/projdefs.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
@@ -17,8 +18,6 @@
 #include "ptp_sync.h"
 #include <stdlib.h>
 #include <string.h>
-
-typedef enum { STATE_UNCONNECTED, STATE_LEADER, STATE_FOLLOWER } node_state_t;
 
 static const char *TAG = "esp_now_rgb";
 static QueueHandle_t s_espnow_queue;
@@ -123,7 +122,6 @@ void espnow_data_prepare(send_param_t *send_param) {
   espnow_data_t *buf = (espnow_data_t *)send_param->buffer;
   buf->type =
       IS_BROADCAST_ADDR(send_param->dest_mac) ? DATA_BROADCAST : DATA_UNICAST;
-  buf->state = send_param->state;
   buf->seq_num = s_espnow_seq[buf->type]++;
   buf->crc = 0;
   buf->magic = send_param->magic;
@@ -147,7 +145,7 @@ static void led_task(void *pvParameter) {
 
   while (1) {
     led_update_t update;
-    // check for incoming LED updates
+    // check for incoming LED updates, implicit 20ms delay (50fps)
     if (xQueueReceive(led_queue, &update, pdMS_TO_TICKS(20)) == pdTRUE) {
 
       if (update.set_period)
@@ -205,6 +203,7 @@ static void espnow_task(void *pvParameter) {
     vTaskDelete(NULL);
   }
 
+  // Sending initial message will queue send callback event
   while (xQueueReceive(s_espnow_queue, &evt, portMAX_DELAY) == pdTRUE) {
     switch (evt.id) {
     case ESPNOW_SEND_CB: {
@@ -220,7 +219,7 @@ static void espnow_task(void *pvParameter) {
       }
 
       if (send_param->delay > 0) {
-        vTaskDelay(send_param->delay / portTICK_PERIOD_MS);
+        vTaskDelay(pdMS_TO_TICKS(send_param->delay));
       }
 
       ESP_LOGI(TAG, "send data to " MACSTR "", MAC2STR(send_cb->mac_addr));
@@ -276,11 +275,6 @@ static void espnow_task(void *pvParameter) {
           update_led(u);
         }
 
-        /* Indicates that the device has received broadcast ESPNOW data. */
-        if (send_param->state == 0) {
-          send_param->state = 1;
-        }
-
         /* If receive broadcast ESPNOW data which indicates that the other
          * device has received broadcast ESPNOW data and the local magic
          * number is bigger than that in the received broadcast ESPNOW data,
@@ -321,15 +315,15 @@ static void espnow_task(void *pvParameter) {
         espnow_data_t *d = (espnow_data_t *)recv_cb->data;
         uint8_t payload_type = d->payload[0];
 
-        switch (payload_type) {
-        case PAYLOAD_TYPE_SYNC:
-          // save sync message for later comparison
-          sync_msg_t *s = (sync_msg_t *)d->payload;
-          uint64_t t_1 = s->t_1;
-          int64_t t2 = esp_timer_get_time();
+        // switch (payload_type) {
+        // case PAYLOAD_TYPE_SYNC:
+        //   // save sync message for later comparison
+        //   sync_msg_t *s = (sync_msg_t *)d->payload;
+        //   uint64_t t_1 = s->t_1;
+        //   int64_t t2 = esp_timer_get_time();
 
-          break;
-        };
+        //  break;
+        //};
 
         /* If receive unicast ESPNOW data, also stop sending broadcast ESPNOW
          * data. */
@@ -398,7 +392,6 @@ static esp_err_t espnow_init(void) {
   memset(send_param, 0, sizeof(send_param_t));
   send_param->unicast = false;
   send_param->broadcast = true;
-  send_param->state = 0;
   send_param->magic = esp_random();
   send_param->delay = ESPNOW_SEND_DELAY;
   send_param->len = ESPNOW_SEND_LEN;

@@ -3,6 +3,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mesh.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "leds.h"
 #include "mesh_config.h"
@@ -10,6 +11,70 @@
 #include <string.h>
 
 static const char *TAG = "MESH_COMMON";
+
+// list implementation
+static struct Node *followers = NULL;
+
+void add_follower(uint8_t *mac_addr) {
+  struct Node *new_follower = NULL;
+  new_follower = (struct Node *)malloc(sizeof(struct Node));
+  if (!new_follower) {
+    ESP_LOGE(TAG, "Malloc follower fail");
+  }
+  memcpy(new_follower->mac_addr, &mac_addr, ESP_NOW_ETH_ALEN);
+  new_follower->last_ping = esp_timer_get_time();
+
+  struct Node *temp = followers;
+  if (temp == NULL) {
+    followers = new_follower;
+    return;
+  }
+
+  // find last node
+  while (temp->next != NULL) {
+    temp = temp->next;
+  }
+
+  temp->next = new_follower;
+}
+
+struct Node *get_follower(uint8_t *mac_addr) {
+  struct Node *temp = followers;
+  while (temp != NULL && !memcmp(mac_addr, temp->mac_addr, ESP_NOW_ETH_ALEN)) {
+    temp = temp->next;
+  }
+
+  return temp;
+}
+
+void delete_follower(uint8_t *mac_addr) {
+  struct Node *before = NULL;
+  struct Node *temp = followers;
+
+  while (temp != NULL && !memcmp(mac_addr, temp->mac_addr, ESP_NOW_ETH_ALEN)) {
+    before = temp;
+    temp = temp->next;
+  }
+
+  if (temp == NULL)
+    return;
+
+  // delete the only item in list
+  if (before == NULL) {
+    followers = NULL;
+    free(temp->mac_addr);
+    free(temp);
+    temp = NULL;
+    return;
+  }
+
+  // there are more items
+  before->next = temp->next;
+  free(temp->mac_addr);
+  free(temp);
+  temp = NULL;
+  return;
+}
 
 void mesh_common_init(void) {
   // Initialize non-volatile storage (required by ESP32 Wi-Fi)
