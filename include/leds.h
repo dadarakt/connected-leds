@@ -1,4 +1,5 @@
 #pragma once
+#include "freertos/idf_additions.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -13,6 +14,8 @@
 #define LEDC_CHANNEL_B LEDC_CHANNEL_2
 #define LEDC_DUTY_RES LEDC_TIMER_8_BIT
 #define LEDC_DUTY_MAX 255
+
+static QueueHandle_t led_queue;
 
 typedef struct {
   uint8_t r;
@@ -30,18 +33,6 @@ typedef struct {
   uint32_t period_ms;
   rgb color;
 } led_task_state_t;
-
-typedef struct {
-  uint8_t payload_type; // PAYLOAD_TYPE_LED_SYNC
-
-  uint8_t r;
-  uint8_t g;
-  uint8_t b;
-
-  uint32_t period_ms;
-  int64_t t0_us; // esp_timer_get_time() reference
-  int64_t tx_us; // esp_timer_get_time() reference
-} __attribute__((packed)) led_sync_payload_t;
 
 typedef struct {
   bool set_mode;
@@ -63,3 +54,4 @@ typedef struct {
 
 void leds_set_rgb(bool state, rgb color);
 void leds_init(void);
+void update_led(led_update_t u);

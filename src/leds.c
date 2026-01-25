@@ -5,6 +5,8 @@
 
 static const char *TAG = "leds";
 
+void update_led(led_update_t u) { xQueueSend(led_queue, &u, 0); }
+
 void leds_set_rgb(bool on, rgb color) {
   uint32_t r = 0;
   uint32_t g = 0;

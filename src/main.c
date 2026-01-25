@@ -2,8 +2,6 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
-#include "esp_timer.h"
-
 #include "esp_netif.h"
 #include "esp_now.h"
 #include "esp_random.h"
@@ -16,29 +14,22 @@
 #include "mesh_common.h"
 #include "mesh_config.h"
 #include "nvs_flash.h"
+#include "ptp_sync.h"
 #include <stdlib.h>
 #include <string.h>
 
+typedef enum { STATE_UNCONNECTED, STATE_LEADER, STATE_FOLLOWER } node_state_t;
+
 static const char *TAG = "esp_now_rgb";
-
-static QueueHandle_t led_queue;
-static led_sync_payload_t last_sync;
-static bool sync_valid = false;
-
-typedef enum { MSG_TYPE_RGB = 0, MSG_TYPE_SYNC = 1 } msg_type_t;
-
-typedef struct {
-  uint8_t type;
-  uint8_t r, g, b;
-  uint32_t seq; // sequence counter
-} __attribute__((packed)) rgb_msg_t;
-
-static uint32_t last_seq = 0;
-
-static QueueHandle_t s_espnow_queue = NULL;
-static uint8_t s_broadcast_mac[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF,
-                                                    0xFF, 0xFF, 0xFF};
+static QueueHandle_t s_espnow_queue;
 static uint16_t s_espnow_seq[DATA_MAX] = {0, 0};
+
+typedef enum {
+  MSG_TYPE_RGB,
+  MSG_TYPE_SYNC,
+  MSG_TYPE_DELAY_REQ,
+  MSQ_TYPE_DELAY_RES,
+} msg_type_t;
 
 static void espnow_deinit(send_param_t *send_param);
 
@@ -49,7 +40,7 @@ static void espnow_deinit(send_param_t *send_param);
  * necessary data to a queue and handle it from a lower priority task. */
 static void send_cb(const esp_now_send_info_t *tx_info,
                     esp_now_send_status_t status) {
-  event_t evt;
+  espnow_event_t evt;
   event_send_cb_t *send_cb = &evt.info.send_cb;
 
   if (tx_info == NULL) {
@@ -67,7 +58,7 @@ static void send_cb(const esp_now_send_info_t *tx_info,
 
 static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
                            const uint8_t *data, int len) {
-  event_t evt;
+  espnow_event_t evt;
   event_recv_cb_t *recv_cb = &evt.info.recv_cb;
   uint8_t *mac_addr = recv_info->src_addr;
   uint8_t *des_addr = recv_info->des_addr;
@@ -105,10 +96,10 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
 /* Parse received ESPNOW data. */
 int espnow_data_parse(uint8_t *data, uint16_t data_len, uint8_t *state,
                       uint16_t *seq, uint32_t *magic) {
-  data_t *buf = (data_t *)data;
+  espnow_data_t *buf = (espnow_data_t *)data;
   uint16_t crc, crc_cal = 0;
 
-  if (data_len < sizeof(data_t)) {
+  if (data_len < sizeof(espnow_data_t)) {
     ESP_LOGE(TAG, "Receive ESPNOW data too short, len:%d", data_len);
     return -1;
   }
@@ -129,7 +120,7 @@ int espnow_data_parse(uint8_t *data, uint16_t data_len, uint8_t *state,
 
 /* Prepare ESPNOW data to be sent. */
 void espnow_data_prepare(send_param_t *send_param) {
-  data_t *buf = (data_t *)send_param->buffer;
+  espnow_data_t *buf = (espnow_data_t *)send_param->buffer;
   buf->type =
       IS_BROADCAST_ADDR(send_param->dest_mac) ? DATA_BROADCAST : DATA_UNICAST;
   buf->state = send_param->state;
@@ -137,20 +128,9 @@ void espnow_data_prepare(send_param_t *send_param) {
   buf->crc = 0;
   buf->magic = send_param->magic;
 
-  led_sync_payload_t *p = (led_sync_payload_t *)buf->payload;
-  p->payload_type = PAYLOAD_TYPE_LED_SYNC;
-  p->r = 0;
-  p->g = 10;
-  p->b = 0;
-  p->period_ms = 1000;
+  // int64_t now_us = esp_timer_get_time();
 
-  int64_t now_us = esp_timer_get_time();
-  p->t0_us = now_us + 200000; // schedule blink 200ms in future
-  p->tx_us = now_us;          // mark transmit timestamp
-
-  send_param->len = sizeof(data_t) + sizeof(led_sync_payload_t);
-  last_sync = *p;
-  sync_valid = true;
+  send_param->len = sizeof(espnow_data_t);
 
   buf->crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)buf, send_param->len);
 }
@@ -205,7 +185,7 @@ static void led_task(void *pvParameter) {
  * The networking task to connects nodes with each other
  */
 static void espnow_task(void *pvParameter) {
-  event_t evt;
+  espnow_event_t evt;
   uint8_t recv_state = 0;
 
   uint16_t recv_seq = 0;
@@ -213,7 +193,7 @@ static void espnow_task(void *pvParameter) {
   bool is_broadcast = false;
   int ret;
 
-  vTaskDelay(5000 / portTICK_PERIOD_MS);
+  vTaskDelay(3000 / portTICK_PERIOD_MS);
   ESP_LOGI(TAG, "Start sending broadcast data");
 
   /* Start sending broadcast ESPNOW data. */
@@ -234,36 +214,11 @@ static void espnow_task(void *pvParameter) {
       ESP_LOGD(TAG, "Send data to " MACSTR ", status1: %d",
                MAC2STR(send_cb->mac_addr), send_cb->status);
 
+      // Stop sending broadcast again when connection was established
       if (is_broadcast && (send_param->broadcast == false)) {
         break;
       }
 
-      if (!is_broadcast && send_cb->status == ESP_NOW_SEND_SUCCESS &&
-          sync_valid) {
-        led_update_t u = {
-            .set_mode = true,
-            .mode = LED_MODE_SYNCED,
-            .set_color = true,
-            .color = {last_sync.r, last_sync.g, last_sync.b},
-            .set_period = true,
-            .period_ms = last_sync.period_ms,
-            .set_sync = true,
-            .t0_us = last_sync.t0_us,
-        };
-
-        xQueueSend(led_queue, &u, 0);
-      }
-
-      if (!is_broadcast) {
-        send_param->count--;
-        if (send_param->count == 0) {
-          ESP_LOGI(TAG, "Send done");
-          espnow_deinit(send_param);
-          vTaskDelete(NULL);
-        }
-      }
-
-      /* Delay a while before sending the next data. */
       if (send_param->delay > 0) {
         vTaskDelay(send_param->delay / portTICK_PERIOD_MS);
       }
@@ -285,10 +240,12 @@ static void espnow_task(void *pvParameter) {
     case ESPNOW_RECV_CB: {
       event_recv_cb_t *recv_cb = &evt.info.recv_cb;
 
+      // take ownership of reiceived data
       ret = espnow_data_parse(recv_cb->data, recv_cb->data_len, &recv_state,
                               &recv_seq, &recv_magic);
       free(recv_cb->data);
-      if (ret == DATA_BROADCAST) {
+      switch (ret) {
+      case DATA_BROADCAST:
         ESP_LOGI(TAG, "Receive %dth broadcast data from: " MACSTR ", len: %d",
                  recv_seq, MAC2STR(recv_cb->mac_addr), recv_cb->data_len);
 
@@ -316,14 +273,7 @@ static void espnow_task(void *pvParameter) {
               .set_color = true,
               .color = (rgb){0, 50, 0}, // green
           };
-          xQueueSend(led_queue, &u, 0);
-
-          // indicate that a connection was made
-          // led_update_t u = {.set_color = true,
-          //                  .color = {0, 255, 0},
-          //                  .set_period = true,
-          //                  .period_ms = 100};
-          // xQueueSend(led_queue, &u, 0);
+          update_led(u);
         }
 
         /* Indicates that the device has received broadcast ESPNOW data. */
@@ -360,32 +310,26 @@ static void espnow_task(void *pvParameter) {
             }
           }
         }
+      case DATA_UNICAST:
+        break;
+      }
+      if (ret == DATA_BROADCAST) {
       } else if (ret == DATA_UNICAST) {
         ESP_LOGI(TAG, "Receive %dth unicast data from: " MACSTR ", len: %d",
                  recv_seq, MAC2STR(recv_cb->mac_addr), recv_cb->data_len);
 
-        data_t *d = (data_t *)recv_cb->data;
+        espnow_data_t *d = (espnow_data_t *)recv_cb->data;
         uint8_t payload_type = d->payload[0];
 
-        if (payload_type == PAYLOAD_TYPE_LED_SYNC) {
-          led_sync_payload_t *p = (led_sync_payload_t *)d->payload;
+        switch (payload_type) {
+        case PAYLOAD_TYPE_SYNC:
+          // save sync message for later comparison
+          sync_msg_t *s = (sync_msg_t *)d->payload;
+          uint64_t t_1 = s->t_1;
+          int64_t t2 = esp_timer_get_time();
 
-          // rx timestamp
-          int64_t rx_us = esp_timer_get_time();
-
-          // send to LED task: include tx timestamp
-          led_update_t u = {
-              .set_color = true,
-              .color = {p->r, p->g, p->b},
-              .set_period = true,
-              .period_ms = p->period_ms,
-              .set_sync = true,
-              .t0_us = p->t0_us,
-              .tx_us = p->tx_us, // sender's transmit time
-          };
-
-          xQueueSend(led_queue, &u, 0);
-        }
+          break;
+        };
 
         /* If receive unicast ESPNOW data, also stop sending broadcast ESPNOW
          * data. */
@@ -406,7 +350,7 @@ static void espnow_task(void *pvParameter) {
 static esp_err_t espnow_init(void) {
   send_param_t *send_param;
 
-  s_espnow_queue = xQueueCreate(ESPNOW_QUEUE_SIZE, sizeof(event_t));
+  s_espnow_queue = xQueueCreate(ESPNOW_QUEUE_SIZE, sizeof(espnow_event_t));
   if (s_espnow_queue == NULL) {
     ESP_LOGE(TAG, "Create queue fail");
     return ESP_FAIL;
@@ -456,7 +400,6 @@ static esp_err_t espnow_init(void) {
   send_param->broadcast = true;
   send_param->state = 0;
   send_param->magic = esp_random();
-  send_param->count = ESPNOW_SEND_COUNT;
   send_param->delay = ESPNOW_SEND_DELAY;
   send_param->len = ESPNOW_SEND_LEN;
   send_param->buffer = malloc(ESPNOW_SEND_LEN);
