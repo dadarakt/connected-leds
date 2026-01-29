@@ -16,8 +16,13 @@
 #include "mesh_config.h"
 #include "nvs_flash.h"
 #include "ptp_sync.h"
+#include "role.h"
 #include <stdlib.h>
 #include <string.h>
+
+#ifndef IS_ROOT
+#error "Build must define ROLE_ROOT or ROLE_NODE"
+#endif
 
 static const char *TAG = "esp_now_rgb";
 static QueueHandle_t s_espnow_queue;
@@ -180,22 +185,55 @@ static void led_task(void *pvParameter) {
 }
 
 /**
- * The networking task to connects nodes with each other
+ * Helper to add a peer and update LED to synced state
  */
-static void espnow_task(void *pvParameter) {
+static bool add_peer_and_sync_led(const uint8_t *mac_addr,
+                                  send_param_t *send_param) {
+  if (esp_now_is_peer_exist(mac_addr)) {
+    return false;
+  }
+
+  esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
+  if (peer == NULL) {
+    ESP_LOGE(TAG, "Malloc peer information fail");
+    return false;
+  }
+  memset(peer, 0, sizeof(esp_now_peer_info_t));
+  peer->channel = ESPNOW_CHANNEL;
+  peer->ifidx = ESPNOW_WIFI_IF;
+  peer->encrypt = true;
+  memcpy(peer->lmk, ESPNOW_LMK, ESP_NOW_KEY_LEN);
+  memcpy(peer->peer_addr, mac_addr, ESP_NOW_ETH_ALEN);
+  ESP_ERROR_CHECK(esp_now_add_peer(peer));
+  free(peer);
+
+  led_update_t u = {
+      .set_mode = true,
+      .mode = LED_MODE_SYNCED,
+      .set_color = true,
+      .color = (rgb){0, 50, 0},
+  };
+  update_led(u);
+
+  return true;
+}
+
+#if IS_ROOT
+/**
+ * Root task: broadcasts to discover nodes, then sends unicast
+ */
+static void espnow_root_task(void *pvParameter) {
   espnow_event_t evt;
   uint8_t recv_state = 0;
-
   uint16_t recv_seq = 0;
   uint32_t recv_magic = 0;
-  bool is_broadcast = false;
   int ret;
 
-  vTaskDelay(3000 / portTICK_PERIOD_MS);
-  ESP_LOGI(TAG, "Start sending broadcast data");
-
-  /* Start sending broadcast ESPNOW data. */
   send_param_t *send_param = (send_param_t *)pvParameter;
+
+  vTaskDelay(pdMS_TO_TICKS(3000));
+  ESP_LOGI(TAG, "Root: Start broadcasting");
+
   if (esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len) !=
       ESP_OK) {
     ESP_LOGE(TAG, "Send error");
@@ -203,18 +241,17 @@ static void espnow_task(void *pvParameter) {
     vTaskDelete(NULL);
   }
 
-  // Sending initial message will queue send callback event
   while (xQueueReceive(s_espnow_queue, &evt, portMAX_DELAY) == pdTRUE) {
     switch (evt.id) {
     case ESPNOW_SEND_CB: {
       event_send_cb_t *send_cb = &evt.info.send_cb;
-      is_broadcast = IS_BROADCAST_ADDR(send_cb->mac_addr);
+      bool is_broadcast = IS_BROADCAST_ADDR(send_cb->mac_addr);
 
-      ESP_LOGD(TAG, "Send data to " MACSTR ", status1: %d",
+      ESP_LOGD(TAG, "Root sent to " MACSTR ", status: %d",
                MAC2STR(send_cb->mac_addr), send_cb->status);
 
-      // Stop sending broadcast again when connection was established
-      if (is_broadcast && (send_param->broadcast == false)) {
+      // Stop broadcasting once we have a peer
+      if (is_broadcast && !send_param->broadcast) {
         break;
       }
 
@@ -222,12 +259,8 @@ static void espnow_task(void *pvParameter) {
         vTaskDelay(pdMS_TO_TICKS(send_param->delay));
       }
 
-      ESP_LOGI(TAG, "send data to " MACSTR "", MAC2STR(send_cb->mac_addr));
-
-      memcpy(send_param->dest_mac, send_cb->mac_addr, ESP_NOW_ETH_ALEN);
       espnow_data_prepare(send_param);
 
-      /* Send the next data after the previous data is sent. */
       if (esp_now_send(send_param->dest_mac, send_param->buffer,
                        send_param->len) != ESP_OK) {
         ESP_LOGE(TAG, "Send error");
@@ -239,97 +272,24 @@ static void espnow_task(void *pvParameter) {
     case ESPNOW_RECV_CB: {
       event_recv_cb_t *recv_cb = &evt.info.recv_cb;
 
-      // take ownership of reiceived data
       ret = espnow_data_parse(recv_cb->data, recv_cb->data_len, &recv_state,
                               &recv_seq, &recv_magic);
       free(recv_cb->data);
-      switch (ret) {
-      case DATA_BROADCAST:
-        ESP_LOGI(TAG, "Receive %dth broadcast data from: " MACSTR ", len: %d",
-                 recv_seq, MAC2STR(recv_cb->mac_addr), recv_cb->data_len);
 
-        /* If MAC address does not exist in peer list, add it to peer list. */
-        if (esp_now_is_peer_exist(recv_cb->mac_addr) == false) {
-          esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
-          if (peer == NULL) {
-            ESP_LOGE(TAG, "Malloc peer information fail");
-            espnow_deinit(send_param);
-            vTaskDelete(NULL);
-          }
-          memset(peer, 0, sizeof(esp_now_peer_info_t));
-          peer->channel = ESPNOW_CHANNEL;
-          peer->ifidx = ESPNOW_WIFI_IF;
-          peer->encrypt = true;
-          memcpy(peer->lmk, ESPNOW_LMK, ESP_NOW_KEY_LEN);
-          memcpy(peer->peer_addr, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
-          ESP_ERROR_CHECK(esp_now_add_peer(peer));
-          free(peer);
-
-          /* LOCAL transition to synced mode (but not yet time-synced) */
-          led_update_t u = {
-              .set_mode = true,
-              .mode = LED_MODE_SYNCED,
-              .set_color = true,
-              .color = (rgb){0, 50, 0}, // green
-          };
-          update_led(u);
-        }
-
-        /* If receive broadcast ESPNOW data which indicates that the other
-         * device has received broadcast ESPNOW data and the local magic
-         * number is bigger than that in the received broadcast ESPNOW data,
-         * stop sending broadcast ESPNOW data and start sending unicast ESPNOW
-         * data.
-         */
-        if (recv_state == 1) {
-          /* The device which has the bigger magic number sends ESPNOW data,
-           * the other one receives ESPNOW data.
-           */
-          if (send_param->unicast == false && send_param->magic >= recv_magic) {
-            ESP_LOGI(TAG, "Start sending unicast data");
-            ESP_LOGI(TAG, "send data to " MACSTR "",
-                     MAC2STR(recv_cb->mac_addr));
-
-            /* Start sending unicast ESPNOW data. */
-            memcpy(send_param->dest_mac, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
-            espnow_data_prepare(send_param);
-            if (esp_now_send(send_param->dest_mac, send_param->buffer,
-                             send_param->len) != ESP_OK) {
-              ESP_LOGE(TAG, "Send error");
-              espnow_deinit(send_param);
-              vTaskDelete(NULL);
-            } else {
-              send_param->broadcast = false;
-              send_param->unicast = true;
-            }
-          }
-        }
-      case DATA_UNICAST:
-        break;
-      }
       if (ret == DATA_BROADCAST) {
+        ESP_LOGI(TAG, "Root: Received broadcast from node " MACSTR,
+                 MAC2STR(recv_cb->mac_addr));
+
+        if (add_peer_and_sync_led(recv_cb->mac_addr, send_param)) {
+          // Switch to unicast to this node
+          memcpy(send_param->dest_mac, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
+          send_param->broadcast = false;
+          send_param->unicast = true;
+          ESP_LOGI(TAG, "Root: Switching to unicast to " MACSTR,
+                   MAC2STR(recv_cb->mac_addr));
+        }
       } else if (ret == DATA_UNICAST) {
-        ESP_LOGI(TAG, "Receive %dth unicast data from: " MACSTR ", len: %d",
-                 recv_seq, MAC2STR(recv_cb->mac_addr), recv_cb->data_len);
-
-        espnow_data_t *d = (espnow_data_t *)recv_cb->data;
-        uint8_t payload_type = d->payload[0];
-
-        // switch (payload_type) {
-        // case PAYLOAD_TYPE_SYNC:
-        //   // save sync message for later comparison
-        //   sync_msg_t *s = (sync_msg_t *)d->payload;
-        //   uint64_t t_1 = s->t_1;
-        //   int64_t t2 = esp_timer_get_time();
-
-        //  break;
-        //};
-
-        /* If receive unicast ESPNOW data, also stop sending broadcast ESPNOW
-         * data. */
-        send_param->broadcast = false;
-      } else {
-        ESP_LOGI(TAG, "Receive error data from: " MACSTR "",
+        ESP_LOGI(TAG, "Root: Received unicast seq=%d from " MACSTR, recv_seq,
                  MAC2STR(recv_cb->mac_addr));
       }
       break;
@@ -340,6 +300,63 @@ static void espnow_task(void *pvParameter) {
     }
   }
 }
+
+#else
+/**
+ * Node task: listens for root broadcasts, responds, receives unicast
+ */
+static void espnow_node_task(void *pvParameter) {
+  espnow_event_t evt;
+  uint8_t recv_state = 0;
+  uint16_t recv_seq = 0;
+  uint32_t recv_magic = 0;
+  int ret;
+
+  send_param_t *send_param = (send_param_t *)pvParameter;
+
+  ESP_LOGI(TAG, "Node: Waiting for root broadcasts");
+
+  while (xQueueReceive(s_espnow_queue, &evt, portMAX_DELAY) == pdTRUE) {
+    switch (evt.id) {
+    case ESPNOW_SEND_CB: {
+      event_send_cb_t *send_cb = &evt.info.send_cb;
+      ESP_LOGD(TAG, "Node sent to " MACSTR ", status: %d",
+               MAC2STR(send_cb->mac_addr), send_cb->status);
+      break;
+    }
+    case ESPNOW_RECV_CB: {
+      event_recv_cb_t *recv_cb = &evt.info.recv_cb;
+
+      ret = espnow_data_parse(recv_cb->data, recv_cb->data_len, &recv_state,
+                              &recv_seq, &recv_magic);
+      free(recv_cb->data);
+
+      if (ret == DATA_BROADCAST) {
+        ESP_LOGI(TAG, "Node: Received broadcast from root " MACSTR,
+                 MAC2STR(recv_cb->mac_addr));
+
+        if (add_peer_and_sync_led(recv_cb->mac_addr, send_param)) {
+          // Send acknowledgment back to root
+          memcpy(send_param->dest_mac, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
+          espnow_data_prepare(send_param);
+          esp_now_send(send_param->dest_mac, send_param->buffer,
+                       send_param->len);
+          ESP_LOGI(TAG, "Node: Sent ack to root " MACSTR,
+                   MAC2STR(recv_cb->mac_addr));
+        }
+      } else if (ret == DATA_UNICAST) {
+        ESP_LOGI(TAG, "Node: Received unicast seq=%d from root", recv_seq);
+        // Future: handle sync messages here
+      }
+      break;
+    }
+    default:
+      ESP_LOGE(TAG, "Callback type error: %d", evt.id);
+      break;
+    }
+  }
+}
+#endif
 
 static esp_err_t espnow_init(void) {
   send_param_t *send_param;
@@ -390,9 +407,6 @@ static esp_err_t espnow_init(void) {
     return ESP_FAIL;
   }
   memset(send_param, 0, sizeof(send_param_t));
-  send_param->unicast = false;
-  send_param->broadcast = true;
-  send_param->magic = esp_random();
   send_param->delay = ESPNOW_SEND_DELAY;
   send_param->len = ESPNOW_SEND_LEN;
   send_param->buffer = malloc(ESPNOW_SEND_LEN);
@@ -404,10 +418,24 @@ static esp_err_t espnow_init(void) {
     esp_now_deinit();
     return ESP_FAIL;
   }
+
+#if IS_ROOT
+  ESP_LOGI(TAG, "Initializing as ROOT");
+  send_param->unicast = false;
+  send_param->broadcast = true;
+  send_param->magic = UINT32_MAX;
   memcpy(send_param->dest_mac, s_broadcast_mac, ESP_NOW_ETH_ALEN);
   espnow_data_prepare(send_param);
-
-  xTaskCreate(espnow_task, "espnow_task", 2048, send_param, 4, NULL);
+  xTaskCreate(espnow_root_task, "espnow_root", 2048, send_param, 4, NULL);
+#else
+  ESP_LOGI(TAG, "Initializing as NODE");
+  send_param->unicast = false;
+  send_param->broadcast = false;
+  send_param->magic = 0;
+  memcpy(send_param->dest_mac, s_broadcast_mac, ESP_NOW_ETH_ALEN);
+  espnow_data_prepare(send_param);
+  xTaskCreate(espnow_node_task, "espnow_node", 2048, send_param, 4, NULL);
+#endif
 
   return ESP_OK;
 }
