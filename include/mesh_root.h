@@ -1,10 +1,7 @@
 #pragma once
 
-#include "esp_mesh.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "mesh_common.h"
 
-static void mesh_event_handler(void *arg, esp_event_base_t base, int32_t id,
-                               void *event_data);
-static void root_task(void *arg);
-void mesh_root_start(void);
+void mesh_root_start(send_param_t *send_param, QueueHandle_t queue);

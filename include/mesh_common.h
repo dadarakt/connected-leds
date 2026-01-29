@@ -1,25 +1,12 @@
 #pragma once
 
 #include "esp_now.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include <stdint.h>
 
 static uint8_t s_broadcast_mac[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF,
                                                     0xFF, 0xFF, 0xFF};
-
-struct Node {
-  uint64_t last_ping;
-  uint8_t mac_addr[ESP_NOW_ETH_ALEN];
-  struct Node *next;
-};
-
-// Initialize LEDs and Wi-Fi / network basics
-void mesh_common_init(void);
-
-// Set LED color
-void set_led(uint8_t r, uint8_t g, uint8_t b);
-
-// Initialize mesh stack (ESP-Mesh)
-void mesh_init(int is_root);
 
 //// Example code from
 /// https://github.com/espressif/esp-idf/blob/v5.5.2/examples/wifi/espnow/main/espnow_example.h
@@ -97,3 +84,13 @@ typedef struct {
   uint8_t *buffer;
   uint8_t dest_mac[ESP_NOW_ETH_ALEN];
 } espnow_state_t;
+
+// Initialization
+void mesh_init(bool is_root);
+
+// Shared ESP-NOW functions
+int espnow_data_parse(uint8_t *data, uint16_t data_len, uint8_t *state,
+                      uint16_t *seq, uint32_t *magic);
+void espnow_data_prepare(send_param_t *send_param);
+bool espnow_add_peer(const uint8_t *mac_addr);
+void espnow_deinit(send_param_t *send_param, QueueHandle_t queue);
