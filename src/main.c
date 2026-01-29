@@ -35,6 +35,16 @@ typedef enum {
   MSQ_TYPE_DELAY_RES,
 } msg_type_t;
 
+typedef enum {
+  ROOT_STATE_BROADCASTING,
+  ROOT_STATE_UNICASTING,
+} root_task_state_t;
+
+typedef enum {
+  NODE_STATE_UNCONNECTED,
+  NODE_STATE_CONNECTED,
+} node_task_state_t;
+
 static void espnow_deinit(send_param_t *send_param);
 
 // ESP-NOW callbacks
@@ -201,8 +211,7 @@ static bool add_peer_and_sync_led(const uint8_t *mac_addr,
   memset(peer, 0, sizeof(esp_now_peer_info_t));
   peer->channel = ESPNOW_CHANNEL;
   peer->ifidx = ESPNOW_WIFI_IF;
-  peer->encrypt = true;
-  memcpy(peer->lmk, ESPNOW_LMK, ESP_NOW_KEY_LEN);
+  peer->encrypt = false;  // Unencrypted for initial handshake
   memcpy(peer->peer_addr, mac_addr, ESP_NOW_ETH_ALEN);
   ESP_ERROR_CHECK(esp_now_add_peer(peer));
   free(peer);
@@ -230,9 +239,17 @@ static void espnow_root_task(void *pvParameter) {
   int ret;
 
   send_param_t *send_param = (send_param_t *)pvParameter;
+  root_task_state_t state = ROOT_STATE_BROADCASTING;
+
+  // Set yellow LED for root while broadcasting
+  led_update_t led = {
+      .set_color = true,
+      .color = (rgb){100, 100, 0},
+  };
+  update_led(led);
 
   vTaskDelay(pdMS_TO_TICKS(3000));
-  ESP_LOGI(TAG, "Root: Start broadcasting");
+  ESP_LOGI(TAG, "Root: State=BROADCASTING, starting broadcast");
 
   if (esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len) !=
       ESP_OK) {
@@ -245,15 +262,9 @@ static void espnow_root_task(void *pvParameter) {
     switch (evt.id) {
     case ESPNOW_SEND_CB: {
       event_send_cb_t *send_cb = &evt.info.send_cb;
-      bool is_broadcast = IS_BROADCAST_ADDR(send_cb->mac_addr);
 
       ESP_LOGD(TAG, "Root sent to " MACSTR ", status: %d",
                MAC2STR(send_cb->mac_addr), send_cb->status);
-
-      // Stop broadcasting once we have a peer
-      if (is_broadcast && !send_param->broadcast) {
-        break;
-      }
 
       if (send_param->delay > 0) {
         vTaskDelay(pdMS_TO_TICKS(send_param->delay));
@@ -261,11 +272,22 @@ static void espnow_root_task(void *pvParameter) {
 
       espnow_data_prepare(send_param);
 
-      if (esp_now_send(send_param->dest_mac, send_param->buffer,
-                       send_param->len) != ESP_OK) {
-        ESP_LOGE(TAG, "Send error");
-        espnow_deinit(send_param);
-        vTaskDelete(NULL);
+      if (state == ROOT_STATE_BROADCASTING) {
+        // Continue broadcasting to discover nodes
+        if (esp_now_send(send_param->dest_mac, send_param->buffer,
+                         send_param->len) != ESP_OK) {
+          ESP_LOGE(TAG, "Send error");
+          espnow_deinit(send_param);
+          vTaskDelete(NULL);
+        }
+      } else if (state == ROOT_STATE_UNICASTING) {
+        // Send unicast to connected node
+        if (esp_now_send(send_param->dest_mac, send_param->buffer,
+                         send_param->len) != ESP_OK) {
+          ESP_LOGE(TAG, "Send error");
+          espnow_deinit(send_param);
+          vTaskDelete(NULL);
+        }
       }
       break;
     }
@@ -276,8 +298,9 @@ static void espnow_root_task(void *pvParameter) {
                               &recv_seq, &recv_magic);
       free(recv_cb->data);
 
-      if (ret == DATA_BROADCAST) {
-        ESP_LOGI(TAG, "Root: Received broadcast from node " MACSTR,
+      if (ret == DATA_BROADCAST || ret == DATA_UNICAST) {
+        ESP_LOGI(TAG, "Root: Received %s from node " MACSTR,
+                 ret == DATA_BROADCAST ? "broadcast" : "unicast",
                  MAC2STR(recv_cb->mac_addr));
 
         if (add_peer_and_sync_led(recv_cb->mac_addr, send_param)) {
@@ -285,12 +308,12 @@ static void espnow_root_task(void *pvParameter) {
           memcpy(send_param->dest_mac, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
           send_param->broadcast = false;
           send_param->unicast = true;
-          ESP_LOGI(TAG, "Root: Switching to unicast to " MACSTR,
+
+          // Transition to UNICASTING state
+          state = ROOT_STATE_UNICASTING;
+          ESP_LOGI(TAG, "Root: State=UNICASTING, connected to " MACSTR,
                    MAC2STR(recv_cb->mac_addr));
         }
-      } else if (ret == DATA_UNICAST) {
-        ESP_LOGI(TAG, "Root: Received unicast seq=%d from " MACSTR, recv_seq,
-                 MAC2STR(recv_cb->mac_addr));
       }
       break;
     }
@@ -313,8 +336,9 @@ static void espnow_node_task(void *pvParameter) {
   int ret;
 
   send_param_t *send_param = (send_param_t *)pvParameter;
+  node_task_state_t state = NODE_STATE_UNCONNECTED;
 
-  ESP_LOGI(TAG, "Node: Waiting for root broadcasts");
+  ESP_LOGI(TAG, "Node: State=UNCONNECTED, waiting for root broadcasts");
 
   while (xQueueReceive(s_espnow_queue, &evt, portMAX_DELAY) == pdTRUE) {
     switch (evt.id) {
@@ -343,6 +367,15 @@ static void espnow_node_task(void *pvParameter) {
                        send_param->len);
           ESP_LOGI(TAG, "Node: Sent ack to root " MACSTR,
                    MAC2STR(recv_cb->mac_addr));
+
+          // Transition to CONNECTED state with yellow LED
+          state = NODE_STATE_CONNECTED;
+          led_update_t u = {
+              .set_color = true,
+              .color = (rgb){100, 100, 0},
+          };
+          update_led(u);
+          ESP_LOGI(TAG, "Node: State=CONNECTED");
         }
       } else if (ret == DATA_UNICAST) {
         ESP_LOGI(TAG, "Node: Received unicast seq=%d from root", recv_seq);
@@ -476,9 +509,7 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(ret);
 
-  // TODO refactor this into a separate function
   leds_init();
-  led_queue = xQueueCreate(4, sizeof(led_update_t));
   xTaskCreate(led_task, "led_task", 2048, NULL, 1, NULL);
 
   wifi_init();

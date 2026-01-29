@@ -15,7 +15,7 @@
 #define LEDC_DUTY_RES LEDC_TIMER_8_BIT
 #define LEDC_DUTY_MAX 255
 
-static QueueHandle_t led_queue;
+extern QueueHandle_t led_queue;
 
 typedef struct {
   uint8_t r;

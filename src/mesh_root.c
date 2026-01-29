@@ -57,6 +57,11 @@ static void root_task(void *arg) {
     data.tos = MESH_TOS_P2P;
 
     // Send to all connected children
+    if (num_children > 0) {
+      ESP_LOGI(TAG, "Broadcasting RGB(%d,%d,%d) to %d children", cmd.r, cmd.g, cmd.b, num_children);
+    } else {
+      ESP_LOGI(TAG, "Waiting for children to connect...");
+    }
     for (int i = 0; i < num_children; i++) {
       esp_err_t err =
           esp_mesh_send(&children[i], &data, portMAX_DELAY, NULL, 0);

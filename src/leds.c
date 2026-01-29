@@ -2,8 +2,11 @@
 #include "driver/ledc.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "freertos/queue.h"
 
 static const char *TAG = "leds";
+
+QueueHandle_t led_queue;
 
 void update_led(led_update_t u) { xQueueSend(led_queue, &u, 0); }
 
@@ -28,6 +31,8 @@ void leds_set_rgb(bool on, rgb color) {
 }
 
 void leds_init(void) {
+  led_queue = xQueueCreate(4, sizeof(led_update_t));
+
   /* Configure LEDC timer */
   ledc_timer_config_t timer_cfg = {
       .speed_mode = LEDC_MODE,
