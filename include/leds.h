@@ -54,4 +54,5 @@ typedef struct {
 
 void leds_set_rgb(bool state, rgb color);
 void leds_init(void);
+void leds_start(void);
 void update_led(led_update_t u);

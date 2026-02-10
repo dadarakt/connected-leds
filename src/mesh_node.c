@@ -72,8 +72,7 @@ static void node_task(void *pvParameter) {
           espnow_data_prepare(send_param);
           esp_now_send(send_param->dest_mac, send_param->buffer,
                        send_param->len);
-          ESP_LOGI(TAG, "Sent ack to root " MACSTR,
-                   MAC2STR(recv_cb->mac_addr));
+          ESP_LOGI(TAG, "Sent ack to root " MACSTR, MAC2STR(recv_cb->mac_addr));
 
           state = NODE_STATE_CONNECTED;
           led_update_t u = {
