@@ -23,6 +23,39 @@ typedef struct {
   QueueHandle_t queue;
 } root_task_params_t;
 
+// --- Time sync helpers ---
+
+static void sync_send(send_param_t *send_param, uint32_t *sync_id) {
+  sync_msg_t sync = {.t_1 = esp_timer_get_time(), .sync_id = (*sync_id)++};
+  espnow_data_prepare_payload(send_param, PAYLOAD_TYPE_SYNC, &sync,
+                              sizeof(sync));
+  if (esp_now_send(send_param->dest_mac, send_param->buffer,
+                   send_param->len) != ESP_OK) {
+    ESP_LOGE(TAG, "Sync send error");
+  }
+  ESP_LOGI(TAG, "Sent sync id=%lu t1=%lld", (unsigned long)sync.sync_id,
+           sync.t_1);
+}
+
+static void sync_handle_delay_req(send_param_t *send_param, uint8_t *data) {
+  espnow_data_t *buf = (espnow_data_t *)data;
+  delay_request_t *dreq = (delay_request_t *)buf->payload;
+  uint32_t req_sync_id = dreq->sync_id;
+
+  delay_response_t dresp = {.t_4 = esp_timer_get_time(),
+                            .sync_id = req_sync_id};
+  espnow_data_prepare_payload(send_param, PAYLOAD_TYPE_DELAY_RESP, &dresp,
+                              sizeof(dresp));
+  if (esp_now_send(send_param->dest_mac, send_param->buffer,
+                   send_param->len) != ESP_OK) {
+    ESP_LOGE(TAG, "Delay response send error");
+  }
+  ESP_LOGI(TAG, "Sent delay_response id=%lu t4=%lld",
+           (unsigned long)req_sync_id, dresp.t_4);
+}
+
+// --- Root task ---
+
 static void root_task(void *pvParameter) {
   root_task_params_t *params = (root_task_params_t *)pvParameter;
   send_param_t *send_param = params->send_param;
@@ -62,15 +95,7 @@ static void root_task(void *pvParameter) {
 
     if (got != pdTRUE) {
       // Timeout — only happens in UNICASTING state, send sync
-      sync_msg_t sync = {.t_1 = esp_timer_get_time(), .sync_id = sync_id++};
-      espnow_data_prepare_payload(send_param, PAYLOAD_TYPE_SYNC, &sync,
-                                  sizeof(sync));
-      if (esp_now_send(send_param->dest_mac, send_param->buffer,
-                       send_param->len) != ESP_OK) {
-        ESP_LOGE(TAG, "Sync send error");
-      }
-      ESP_LOGI(TAG, "Sent sync id=%lu t1=%lld", (unsigned long)sync.sync_id,
-               sync.t_1);
+      sync_send(send_param, &sync_id);
       continue;
     }
 
@@ -124,8 +149,6 @@ static void root_task(void *pvParameter) {
           led_update_t u = {
               .set_mode = true,
               .mode = LED_MODE_SYNCED,
-              .set_color = true,
-              .color = (rgb){0, 100, 0},
               .set_sync = true,
               .t0_us = 0,
               .tx_us = now,
@@ -134,20 +157,7 @@ static void root_task(void *pvParameter) {
         }
       } else if (state == ROOT_STATE_UNICASTING &&
                  recv_payload_type == PAYLOAD_TYPE_DELAY_REQ) {
-        espnow_data_t *buf = (espnow_data_t *)recv_cb->data;
-        delay_request_t *dreq = (delay_request_t *)buf->payload;
-        uint32_t req_sync_id = dreq->sync_id;
-
-        delay_response_t dresp = {.t_4 = esp_timer_get_time(),
-                                  .sync_id = req_sync_id};
-        espnow_data_prepare_payload(send_param, PAYLOAD_TYPE_DELAY_RESP, &dresp,
-                                    sizeof(dresp));
-        if (esp_now_send(send_param->dest_mac, send_param->buffer,
-                         send_param->len) != ESP_OK) {
-          ESP_LOGE(TAG, "Delay response send error");
-        }
-        ESP_LOGI(TAG, "Sent delay_response id=%lu t4=%lld",
-                 (unsigned long)req_sync_id, dresp.t_4);
+        sync_handle_delay_req(send_param, recv_cb->data);
       }
 
       free(recv_cb->data);

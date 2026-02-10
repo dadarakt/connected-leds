@@ -23,6 +23,79 @@ typedef struct {
   QueueHandle_t queue;
 } node_task_params_t;
 
+// --- Time sync state and helpers ---
+
+typedef struct {
+  int64_t pending_t1;
+  int64_t pending_t2;
+  int64_t pending_t3;
+  uint32_t pending_sync_id;
+  bool synced;
+} sync_state_t;
+
+static void sync_handle_sync_msg(sync_state_t *ss, send_param_t *send_param,
+                                 uint8_t *data) {
+  int64_t t2 = esp_timer_get_time();
+  espnow_data_t *buf = (espnow_data_t *)data;
+  sync_msg_t *sync = (sync_msg_t *)buf->payload;
+
+  ss->pending_t1 = sync->t_1;
+  ss->pending_t2 = t2;
+  ss->pending_sync_id = sync->sync_id;
+
+  ESP_LOGI(TAG, "Received sync id=%lu t1=%lld t2=%lld",
+           (unsigned long)ss->pending_sync_id, ss->pending_t1, ss->pending_t2);
+
+  delay_request_t dreq = {.sync_id = ss->pending_sync_id};
+  ss->pending_t3 = esp_timer_get_time();
+  espnow_data_prepare_payload(send_param, PAYLOAD_TYPE_DELAY_REQ, &dreq,
+                              sizeof(dreq));
+  if (esp_now_send(send_param->dest_mac, send_param->buffer,
+                   send_param->len) != ESP_OK) {
+    ESP_LOGE(TAG, "Delay request send error");
+  }
+}
+
+// Returns true if the response was valid and sync was applied.
+static bool sync_handle_delay_resp(sync_state_t *ss, uint8_t *data) {
+  int64_t t5 = esp_timer_get_time();
+  espnow_data_t *buf = (espnow_data_t *)data;
+  delay_response_t *dresp = (delay_response_t *)buf->payload;
+
+  if ((uint32_t)dresp->sync_id != ss->pending_sync_id) {
+    ESP_LOGW(TAG, "sync_id mismatch: got %ld expected %lu",
+             (long)dresp->sync_id, (unsigned long)ss->pending_sync_id);
+    return false;
+  }
+
+  int64_t rtt = t5 - ss->pending_t3;
+  int64_t one_way = rtt / 2;
+  int64_t clock_offset = (ss->pending_t1 + one_way) - ss->pending_t2;
+
+  ESP_LOGI(TAG, "Sync id=%lu rtt=%lld us one_way=%lld us offset=%lld us",
+           (unsigned long)ss->pending_sync_id, rtt, one_way, clock_offset);
+
+  led_update_t u = {
+      .set_sync = true,
+      .t0_us = ss->pending_t2 - ss->pending_t1 - one_way,
+      .tx_us = t5,
+  };
+  update_led(u);
+
+  if (!ss->synced) {
+    ss->synced = true;
+    led_update_t mode_u = {
+        .set_mode = true,
+        .mode = LED_MODE_SYNCED,
+    };
+    update_led(mode_u);
+  }
+
+  return true;
+}
+
+// --- Node task ---
+
 static void node_task(void *pvParameter) {
   node_task_params_t *params = (node_task_params_t *)pvParameter;
   send_param_t *send_param = params->send_param;
@@ -36,11 +109,7 @@ static void node_task(void *pvParameter) {
   int ret;
 
   node_conn_state_t state = NODE_STATE_UNCONNECTED;
-  bool synced = false;
-
-  // Pending sync state
-  int64_t pending_t1 = 0, pending_t2 = 0, pending_t3 = 0;
-  uint32_t pending_sync_id = 0;
+  sync_state_t ss = {0};
 
   ESP_LOGI(TAG, "State=UNCONNECTED, waiting for root broadcasts");
 
@@ -84,62 +153,10 @@ static void node_task(void *pvParameter) {
         }
       } else if (state == NODE_STATE_CONNECTED &&
                  recv_payload_type == PAYLOAD_TYPE_SYNC) {
-        int64_t t2 = esp_timer_get_time();
-        espnow_data_t *buf = (espnow_data_t *)recv_cb->data;
-        sync_msg_t *sync = (sync_msg_t *)buf->payload;
-        pending_t1 = sync->t_1;
-        pending_t2 = t2;
-        pending_sync_id = sync->sync_id;
-
-        ESP_LOGI(TAG, "Received sync id=%lu t1=%lld t2=%lld",
-                 (unsigned long)pending_sync_id, pending_t1, pending_t2);
-
-        // Immediately send delay_request
-        delay_request_t dreq = {.sync_id = pending_sync_id};
-        pending_t3 = esp_timer_get_time();
-        espnow_data_prepare_payload(send_param, PAYLOAD_TYPE_DELAY_REQ, &dreq,
-                                    sizeof(dreq));
-        if (esp_now_send(send_param->dest_mac, send_param->buffer,
-                         send_param->len) != ESP_OK) {
-          ESP_LOGE(TAG, "Delay request send error");
-        }
+        sync_handle_sync_msg(&ss, send_param, recv_cb->data);
       } else if (state == NODE_STATE_CONNECTED &&
                  recv_payload_type == PAYLOAD_TYPE_DELAY_RESP) {
-        int64_t t5 = esp_timer_get_time();
-        espnow_data_t *buf = (espnow_data_t *)recv_cb->data;
-        delay_response_t *dresp = (delay_response_t *)buf->payload;
-
-        if ((uint32_t)dresp->sync_id != pending_sync_id) {
-          ESP_LOGW(TAG, "sync_id mismatch: got %ld expected %lu",
-                   (long)dresp->sync_id, (unsigned long)pending_sync_id);
-          free(recv_cb->data);
-          break;
-        }
-
-        int64_t rtt = t5 - pending_t3;
-        int64_t one_way = rtt / 2;
-        int64_t clock_offset = (pending_t1 + one_way) - pending_t2;
-
-        ESP_LOGI(TAG, "Sync id=%lu rtt=%lld us one_way=%lld us offset=%lld us",
-                 (unsigned long)pending_sync_id, rtt, one_way, clock_offset);
-
-        led_update_t u = {
-            .set_sync = true,
-            .t0_us = pending_t2 - pending_t1 - one_way,
-            .tx_us = t5,
-        };
-        update_led(u);
-
-        if (!synced) {
-          synced = true;
-          led_update_t mode_u = {
-              .set_mode = true,
-              .mode = LED_MODE_SYNCED,
-              .set_color = true,
-              .color = (rgb){0, 100, 0},
-          };
-          update_led(mode_u);
-        }
+        sync_handle_delay_resp(&ss, recv_cb->data);
       }
 
       free(recv_cb->data);
