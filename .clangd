@@ -1,0 +1,11 @@
+CompileFlags:
+  Remove:
+    - -mlongcalls
+    - -fno-shrink-wrap
+    - -fno-tree-switch-conversion
+    - -fstrict-volatile-bitfields
+  Add:
+    - -I/Users/jannis/.platformio/packages/toolchain-xtensa-esp32/xtensa-esp32-elf/include
+    - -D__XTENSA__=1
+Diagnostics:
+  UnusedIncludes: None
