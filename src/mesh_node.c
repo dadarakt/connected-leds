@@ -50,8 +50,8 @@ static void sync_handle_sync_msg(sync_state_t *ss, send_param_t *send_param,
   ss->pending_t3 = esp_timer_get_time();
   espnow_data_prepare_payload(send_param, PAYLOAD_TYPE_DELAY_REQ, &dreq,
                               sizeof(dreq));
-  if (esp_now_send(send_param->dest_mac, send_param->buffer,
-                   send_param->len) != ESP_OK) {
+  if (esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len) !=
+      ESP_OK) {
     ESP_LOGE(TAG, "Delay request send error");
   }
 }
@@ -94,6 +94,31 @@ static bool sync_handle_delay_resp(sync_state_t *ss, uint8_t *data) {
   return true;
 }
 
+// --- Connection handling ---
+
+// Returns true if the node successfully connected to the root.
+static bool handle_root_broadcast(send_param_t *send_param,
+                                  const uint8_t *mac_addr) {
+  if (!esp_now_is_peer_exist(mac_addr)) {
+    if (!espnow_add_peer(mac_addr)) {
+      return false;
+    }
+  }
+
+  memcpy(send_param->dest_mac, mac_addr, ESP_NOW_ETH_ALEN);
+  espnow_data_prepare(send_param);
+  esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len);
+  ESP_LOGI(TAG, "Sent ack to root " MACSTR, MAC2STR(mac_addr));
+
+  led_update_t u = {
+      .set_color = true,
+      .color = (rgb){100, 100, 0},
+  };
+  update_led(u);
+  ESP_LOGI(TAG, "State=CONNECTED");
+  return true;
+}
+
 // --- Node task ---
 
 static void node_task(void *pvParameter) {
@@ -106,14 +131,43 @@ static void node_task(void *pvParameter) {
   uint8_t recv_payload_type = 0;
   uint16_t recv_seq = 0;
   uint32_t recv_magic = 0;
-  int ret;
 
   node_conn_state_t state = NODE_STATE_UNCONNECTED;
   sync_state_t ss = {0};
+  TickType_t last_sync_tick = 0;
 
   ESP_LOGI(TAG, "State=UNCONNECTED, waiting for root broadcasts");
 
-  while (xQueueReceive(queue, &evt, portMAX_DELAY) == pdTRUE) {
+  while (true) {
+    TickType_t wait_ticks;
+    if (state == NODE_STATE_CONNECTED) {
+      TickType_t now = xTaskGetTickCount();
+      TickType_t elapsed = now - last_sync_tick;
+      TickType_t timeout = pdMS_TO_TICKS(ESPNOW_NODE_TIMEOUT_MS);
+      if (elapsed >= timeout) {
+        wait_ticks = 0;
+      } else {
+        wait_ticks = timeout - elapsed;
+      }
+    } else {
+      wait_ticks = portMAX_DELAY;
+    }
+
+    BaseType_t got = xQueueReceive(queue, &evt, wait_ticks);
+
+    if (got != pdTRUE) {
+      // Timeout: lost connection to root
+      ESP_LOGW(TAG, "Sync timeout, resetting to UNCONNECTED");
+      state = NODE_STATE_UNCONNECTED;
+      memset(&ss, 0, sizeof(ss));
+      led_update_t u = {
+          .set_mode = true,
+          .mode = LED_MODE_SEARCHING,
+      };
+      update_led(u);
+      continue;
+    }
+
     switch (evt.id) {
     case ESPNOW_SEND_CB: {
       event_send_cb_t *send_cb = &evt.info.send_cb;
@@ -124,9 +178,8 @@ static void node_task(void *pvParameter) {
     case ESPNOW_RECV_CB: {
       event_recv_cb_t *recv_cb = &evt.info.recv_cb;
 
-      ret = espnow_data_parse(recv_cb->data, recv_cb->data_len,
-                              &recv_payload_type, &recv_seq, &recv_magic);
-
+      int ret = espnow_data_parse(recv_cb->data, recv_cb->data_len,
+                                  &recv_payload_type, &recv_seq, &recv_magic);
       if (ret < 0) {
         free(recv_cb->data);
         break;
@@ -135,24 +188,13 @@ static void node_task(void *pvParameter) {
       if (state == NODE_STATE_UNCONNECTED && ret == DATA_BROADCAST) {
         ESP_LOGI(TAG, "Received broadcast from root " MACSTR,
                  MAC2STR(recv_cb->mac_addr));
-
-        if (espnow_add_peer(recv_cb->mac_addr)) {
-          memcpy(send_param->dest_mac, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
-          espnow_data_prepare(send_param);
-          esp_now_send(send_param->dest_mac, send_param->buffer,
-                       send_param->len);
-          ESP_LOGI(TAG, "Sent ack to root " MACSTR, MAC2STR(recv_cb->mac_addr));
-
+        if (handle_root_broadcast(send_param, recv_cb->mac_addr)) {
           state = NODE_STATE_CONNECTED;
-          led_update_t u = {
-              .set_color = true,
-              .color = (rgb){100, 100, 0},
-          };
-          update_led(u);
-          ESP_LOGI(TAG, "State=CONNECTED");
+          last_sync_tick = xTaskGetTickCount();
         }
       } else if (state == NODE_STATE_CONNECTED &&
                  recv_payload_type == PAYLOAD_TYPE_SYNC) {
+        last_sync_tick = xTaskGetTickCount();
         sync_handle_sync_msg(&ss, send_param, recv_cb->data);
       } else if (state == NODE_STATE_CONNECTED &&
                  recv_payload_type == PAYLOAD_TYPE_DELAY_RESP) {

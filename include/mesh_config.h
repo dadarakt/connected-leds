@@ -18,3 +18,8 @@
 #define ESPNOW_WAKE_INTERVAL 100
 #define ESPNOW_QUEUE_SIZE 6
 #define ESPNOW_MAXDELAY 512
+
+#define ESPNOW_SYNC_INTERVAL_MS 5000 // Root broadcasts sync this often
+#define ESPNOW_DISCOVERY_INTERVAL_MS                                           \
+  2000                               // Root broadcasts discovery this often
+#define ESPNOW_NODE_TIMEOUT_MS 15000 // Node resets if no sync for this long

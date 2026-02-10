@@ -102,6 +102,7 @@ void espnow_data_prepare(send_param_t *send_param) {
   buf->seq_num = s_espnow_seq[buf->type]++;
   buf->crc = 0;
   buf->magic = send_param->magic;
+  buf->payload_type = PAYLOAD_TYPE_NONE;
 
   send_param->len = sizeof(espnow_data_t);
 
