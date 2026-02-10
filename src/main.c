@@ -24,6 +24,8 @@ static void led_task(void *pvParameter) {
     // check for incoming LED updates, implicit 20ms delay (50fps)
     if (xQueueReceive(led_queue, &update, pdMS_TO_TICKS(20)) == pdTRUE) {
 
+      if (update.set_mode)
+        state.mode = update.mode;
       if (update.set_period)
         state.period_ms = update.period_ms;
       if (update.set_color)

@@ -22,7 +22,9 @@ typedef enum {
 typedef enum {
   PAYLOAD_TYPE_NONE,
   PAYLOAD_TYPE_LED_SYNC,
-  PAYLOAD_TYPE_SYNC
+  PAYLOAD_TYPE_SYNC,
+  PAYLOAD_TYPE_DELAY_REQ,
+  PAYLOAD_TYPE_DELAY_RESP,
 } payload_type_t;
 
 typedef struct {
@@ -57,8 +59,8 @@ enum {
 typedef enum { STATE_LEADER, STATE_FOLLOWER } node_state_t;
 
 typedef struct {
-  uint8_t type;  // Broadcast or unicast ESPNOW data.
-  uint8_t state; // Indicate that if has received broadcast ESPNOW data or not.
+  uint8_t type;         // Broadcast or unicast ESPNOW data.
+  uint8_t payload_type; // payload_type_t value
   uint16_t seq_num;   // Sequence number of ESPNOW data.
   uint16_t crc;       // CRC16 value of ESPNOW data.
   uint32_t magic;     // Magic number used to determine leadership
@@ -89,8 +91,11 @@ typedef struct {
 void mesh_init(bool is_root);
 
 // Shared ESP-NOW functions
-int espnow_data_parse(uint8_t *data, uint16_t data_len, uint8_t *state,
+int espnow_data_parse(uint8_t *data, uint16_t data_len, uint8_t *payload_type,
                       uint16_t *seq, uint32_t *magic);
 void espnow_data_prepare(send_param_t *send_param);
+void espnow_data_prepare_payload(send_param_t *send_param,
+                                 payload_type_t payload_type,
+                                 const void *payload, size_t payload_len);
 bool espnow_add_peer(const uint8_t *mac_addr);
 void espnow_deinit(send_param_t *send_param, QueueHandle_t queue);

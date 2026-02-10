@@ -71,7 +71,7 @@ static void recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data,
 
 // Data parsing and preparation
 
-int espnow_data_parse(uint8_t *data, uint16_t data_len, uint8_t *state,
+int espnow_data_parse(uint8_t *data, uint16_t data_len, uint8_t *payload_type,
                       uint16_t *seq, uint32_t *magic) {
   espnow_data_t *buf = (espnow_data_t *)data;
   uint16_t crc, crc_cal = 0;
@@ -81,7 +81,7 @@ int espnow_data_parse(uint8_t *data, uint16_t data_len, uint8_t *state,
     return -1;
   }
 
-  *state = buf->state;
+  *payload_type = buf->payload_type;
   *seq = buf->seq_num;
   *magic = buf->magic;
   crc = buf->crc;
@@ -105,6 +105,23 @@ void espnow_data_prepare(send_param_t *send_param) {
 
   send_param->len = sizeof(espnow_data_t);
 
+  buf->crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)buf, send_param->len);
+}
+
+void espnow_data_prepare_payload(send_param_t *send_param,
+                                 payload_type_t payload_type,
+                                 const void *payload, size_t payload_len) {
+  espnow_data_t *buf = (espnow_data_t *)send_param->buffer;
+  buf->type =
+      IS_BROADCAST_ADDR(send_param->dest_mac) ? DATA_BROADCAST : DATA_UNICAST;
+  buf->seq_num = s_espnow_seq[buf->type]++;
+  buf->magic = send_param->magic;
+  buf->payload_type = payload_type;
+  if (payload && payload_len > 0) {
+    memcpy(buf->payload, payload, payload_len);
+  }
+  send_param->len = sizeof(espnow_data_t) + payload_len;
+  buf->crc = 0;
   buf->crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)buf, send_param->len);
 }
 
